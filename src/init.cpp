@@ -63,6 +63,7 @@
 
 #if ENABLE_ZMQ
 #include <zmq/zmqnotificationinterface.h>
+#include <zmq/zmqrpc.h>
 #endif
 
 bool fFeeEstimatesInitialized = false;
@@ -98,10 +99,6 @@ void DummyWalletInit::AddWalletOptions() const
 }
 
 const WalletInitInterface& g_wallet_init_interface = DummyWalletInit();
-#endif
-
-#if ENABLE_ZMQ
-static CZMQNotificationInterface* pzmqNotificationInterface = nullptr;
 #endif
 
 #ifdef WIN32
@@ -212,11 +209,7 @@ void Shutdown()
     // using the other before destroying them.
     if (peerLogic) UnregisterValidationInterface(peerLogic.get());
     if (g_connman) g_connman->Stop();
-    peerLogic.reset();
-    g_connman.reset();
-    if (g_txindex) {
-        g_txindex.reset();
-    }
+    if (g_txindex) g_txindex->Stop();
 
     StopTorControl();
 
@@ -224,6 +217,12 @@ void Shutdown()
     // CScheduler/checkqueue threadGroup
     threadGroup.interrupt_all();
     threadGroup.join_all();
+
+    // After the threads that potentially access these pointers have been stopped,
+    // destruct and reset all to nullptr.
+    peerLogic.reset();
+    g_connman.reset();
+    g_txindex.reset();
 
     if (g_is_mempool_loaded && gArgs.GetArg("-persistmempool", DEFAULT_PERSIST_MEMPOOL)) {
         DumpMempool();
@@ -269,10 +268,10 @@ void Shutdown()
     g_wallet_init_interface.Stop();
 
 #if ENABLE_ZMQ
-    if (pzmqNotificationInterface) {
-        UnregisterValidationInterface(pzmqNotificationInterface);
-        delete pzmqNotificationInterface;
-        pzmqNotificationInterface = nullptr;
+    if (g_zmq_notification_interface) {
+        UnregisterValidationInterface(g_zmq_notification_interface);
+        delete g_zmq_notification_interface;
+        g_zmq_notification_interface = nullptr;
     }
 #endif
 
@@ -329,12 +328,12 @@ static void registerSignalHandler(int signal, void(*handler)(int))
 
 static void OnRPCStarted()
 {
-    uiInterface.NotifyBlockTip.connect(&RPCNotifyBlockChange);
+    uiInterface.NotifyBlockTip_connect(&RPCNotifyBlockChange);
 }
 
 static void OnRPCStopped()
 {
-    uiInterface.NotifyBlockTip.disconnect(&RPCNotifyBlockChange);
+    uiInterface.NotifyBlockTip_disconnect(&RPCNotifyBlockChange);
     RPCNotifyBlockChange(false, nullptr);
     g_best_block_cv.notify_all();
     LogPrint(BCLog::RPC, "RPC stopped.\n");
@@ -367,7 +366,7 @@ void SetupServerArgs()
     gArgs.AddArg("-datadir=<dir>", "Specify data directory", false, OptionsCategory::OPTIONS);
     gArgs.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", nDefaultDbBatchSize), true, OptionsCategory::OPTIONS);
     gArgs.AddArg("-dbcache=<n>", strprintf("Set database cache size in megabytes (%d to %d, default: %d)", nMinDbCache, nMaxDbCache, nDefaultDbCache), false, OptionsCategory::OPTIONS);
-    gArgs.AddArg("-debuglogfile=<file>", strprintf("Specify location of debug log file. Relative paths will be prefixed by a net-specific datadir location. (default: %s)", DEFAULT_DEBUGLOGFILE), false, OptionsCategory::OPTIONS);
+    gArgs.AddArg("-debuglogfile=<file>", strprintf("Specify location of debug log file. Relative paths will be prefixed by a net-specific datadir location. (0 to disable; default: %s)", DEFAULT_DEBUGLOGFILE), false, OptionsCategory::OPTIONS);
     gArgs.AddArg("-feefilter", strprintf("Tell other nodes to filter invs to us by our mempool min fee (default: %u)", DEFAULT_FEEFILTER), true, OptionsCategory::OPTIONS);
     gArgs.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", false, OptionsCategory::OPTIONS);
     gArgs.AddArg("-loadblock=<file>", "Imports blocks from external blk000??.dat file on startup", false, OptionsCategory::OPTIONS);
@@ -385,7 +384,7 @@ void SetupServerArgs()
 #endif
     gArgs.AddArg("-prune=<n>", strprintf("Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC to be called to delete specific blocks, and enables automatic pruning of old blocks if a target size in MiB is provided. This mode is incompatible with -txindex and -rescan. "
             "Warning: Reverting this setting requires re-downloading the entire blockchain. "
-            "(default: 0 = disable pruning blocks, 1 = allow manual pruning via RPC, >%u = automatically prune block files to stay under the specified target size in MiB)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024), false, OptionsCategory::OPTIONS);
+            "(default: 0 = disable pruning blocks, 1 = allow manual pruning via RPC, >=%u = automatically prune block files to stay under the specified target size in MiB)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024), false, OptionsCategory::OPTIONS);
     gArgs.AddArg("-reindex", "Rebuild chain state and block index from the blk*.dat files on disk", false, OptionsCategory::OPTIONS);
     gArgs.AddArg("-reindex-chainstate", "Rebuild chain state from the currently indexed blocks", false, OptionsCategory::OPTIONS);
 #ifndef WIN32
@@ -479,7 +478,7 @@ void SetupServerArgs()
     gArgs.AddArg("-maxtxfee=<amt>", strprintf("Maximum total fees (in %s) to use in a single wallet transaction or raw transaction; setting this too low may abort large transactions (default: %s)",
         CURRENCY_UNIT, FormatMoney(DEFAULT_TRANSACTION_MAXFEE)), false, OptionsCategory::DEBUG_TEST);
     gArgs.AddArg("-printpriority", strprintf("Log transaction fee per kB when mining blocks (default: %u)", DEFAULT_PRINTPRIORITY), true, OptionsCategory::DEBUG_TEST);
-    gArgs.AddArg("-printtoconsole", "Send trace/debug info to console instead of debug.log file", false, OptionsCategory::DEBUG_TEST);
+    gArgs.AddArg("-printtoconsole", "Send trace/debug info to console (default: 1 when no -daemon. To disable logging to file, set debuglogfile=0)", false, OptionsCategory::DEBUG_TEST);
     gArgs.AddArg("-shrinkdebugfile", "Shrink debug.log file on client startup (default: 1 when no -debug)", false, OptionsCategory::DEBUG_TEST);
     gArgs.AddArg("-uacomment=<cmt>", "Append comment to the user agent string", false, OptionsCategory::DEBUG_TEST);
 
@@ -504,7 +503,7 @@ void SetupServerArgs()
 
     gArgs.AddArg("-rest", strprintf("Accept public REST requests (default: %u)", DEFAULT_REST_ENABLE), false, OptionsCategory::RPC);
     gArgs.AddArg("-rpcallowip=<ip>", "Allow JSON-RPC connections from specified source. Valid for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24). This option can be specified multiple times", false, OptionsCategory::RPC);
-    gArgs.AddArg("-rpcauth=<userpw>", "Username and hashed password for JSON-RPC connections. The field <userpw> comes in the format: <USERNAME>:<SALT>$<HASH>. A canonical python script is included in share/rpcuser. The client then connects normally using the rpcuser=<USERNAME>/rpcpassword=<PASSWORD> pair of arguments. This option can be specified multiple times", false, OptionsCategory::RPC);
+    gArgs.AddArg("-rpcauth=<userpw>", "Username and hashed password for JSON-RPC connections. The field <userpw> comes in the format: <USERNAME>:<SALT>$<HASH>. A canonical python script is included in share/rpcauth. The client then connects normally using the rpcuser=<USERNAME>/rpcpassword=<PASSWORD> pair of arguments. This option can be specified multiple times", false, OptionsCategory::RPC);
     gArgs.AddArg("-rpcbind=<addr>[:port]", "Bind to given address to listen for JSON-RPC connections. This option is ignored unless -rpcallowip is also passed. Port is optional and overrides -rpcport. Use [host]:port notation for IPv6. This option can be specified multiple times (default: 127.0.0.1 and ::1 i.e., localhost, or if -rpcallowip has been specified, 0.0.0.0 and :: i.e., all addresses)", false, OptionsCategory::RPC);
     gArgs.AddArg("-rpccookiefile=<loc>", "Location of the auth cookie. Relative paths will be prefixed by a net-specific datadir location. (default: data dir)", false, OptionsCategory::RPC);
     gArgs.AddArg("-rpcpassword=<pw>", "Password for JSON-RPC connections", false, OptionsCategory::RPC);
@@ -734,14 +733,11 @@ static bool AppInitServers()
     RPCServer::OnStopped(&OnRPCStopped);
     if (!InitHTTPServer())
         return false;
-    if (!StartRPC())
-        return false;
+    StartRPC();
     if (!StartHTTPRPC())
         return false;
-    if (gArgs.GetBoolArg("-rest", DEFAULT_REST_ENABLE) && !StartREST())
-        return false;
-    if (!StartHTTPServer())
-        return false;
+    if (gArgs.GetBoolArg("-rest", DEFAULT_REST_ENABLE)) StartREST();
+    StartHTTPServer();
     return true;
 }
 
@@ -930,7 +926,7 @@ bool AppInitParameterInteraction()
     // also see: InitParameterInteraction()
 
     if (!fs::is_directory(GetBlocksDir(false))) {
-        return InitError(strprintf(_("Specified blocks directory \"%s\" does not exist.\n"), gArgs.GetArg("-blocksdir", "").c_str()));
+        return InitError(strprintf(_("Specified blocks directory \"%s\" does not exist."), gArgs.GetArg("-blocksdir", "").c_str()));
     }
 
     // if using block pruning, then disallow txindex
@@ -1125,8 +1121,6 @@ bool AppInitParameterInteraction()
     if (gArgs.GetBoolArg("-peerbloomfilters", DEFAULT_PEERBLOOMFILTERS))
         nLocalServices = ServiceFlags(nLocalServices | NODE_BLOOM);
 
-    g_enable_bip61 = gArgs.GetBoolArg("-enablebip61", DEFAULT_ENABLE_BIP61);
-
     if (gArgs.GetArg("-rpcserialversion", DEFAULT_RPC_SERIALIZE_VERSION) < 0)
         return InitError("rpcserialversion must be non-negative.");
 
@@ -1282,6 +1276,9 @@ bool AppInitMain()
      */
     RegisterAllCoreRPCCommands(tableRPC);
     g_wallet_init_interface.RegisterRPC(tableRPC);
+#if ENABLE_ZMQ
+    RegisterZMQRPCCommands(tableRPC);
+#endif
 
     /* Start the RPC server already.  It will be started in "warmup" mode
      * and not really process calls already (but it will signify connections
@@ -1290,12 +1287,10 @@ bool AppInitMain()
      */
     if (gArgs.GetBoolArg("-server", false))
     {
-        uiInterface.InitMessage.connect(SetRPCWarmupStatus);
+        uiInterface.InitMessage_connect(SetRPCWarmupStatus);
         if (!AppInitServers())
             return InitError(_("Unable to start HTTP server. See debug log for details."));
     }
-
-    int64_t nStart;
 
     // ********************************************************* Step 5: verify wallet database integrity
     if (!g_wallet_init_interface.Verify()) return false;
@@ -1310,7 +1305,7 @@ bool AppInitMain()
     g_connman = std::unique_ptr<CConnman>(new CConnman(GetRand(std::numeric_limits<uint64_t>::max()), GetRand(std::numeric_limits<uint64_t>::max())));
     CConnman& connman = *g_connman;
 
-    peerLogic.reset(new PeerLogicValidation(&connman, scheduler));
+    peerLogic.reset(new PeerLogicValidation(&connman, scheduler, gArgs.GetBoolArg("-enablebip61", DEFAULT_ENABLE_BIP61)));
     RegisterValidationInterface(peerLogic.get());
 
     // sanitize comments per BIP-0014, format user agent and check total size
@@ -1400,10 +1395,10 @@ bool AppInitMain()
     }
 
 #if ENABLE_ZMQ
-    pzmqNotificationInterface = CZMQNotificationInterface::Create();
+    g_zmq_notification_interface = CZMQNotificationInterface::Create();
 
-    if (pzmqNotificationInterface) {
-        RegisterValidationInterface(pzmqNotificationInterface);
+    if (g_zmq_notification_interface) {
+        RegisterValidationInterface(g_zmq_notification_interface);
     }
 #endif
     uint64_t nMaxOutboundLimit = 0; //unlimited unless -maxuploadtarget is set
@@ -1448,8 +1443,8 @@ bool AppInitMain()
 
         LOCK(cs_main);
 
-        nStart = GetTimeMillis();
         do {
+            const int64_t load_block_index_start_time = GetTimeMillis();
             try {
                 UnloadBlockIndex();
                 pcoinsTip.reset();
@@ -1572,6 +1567,7 @@ bool AppInitMain()
             }
 
             fLoaded = true;
+            LogPrintf(" block index %15dms\n", GetTimeMillis() - load_block_index_start_time);
         } while(false);
 
         if (!fLoaded && !ShutdownRequested()) {
@@ -1600,9 +1596,6 @@ bool AppInitMain()
     if (ShutdownRequested()) {
         LogPrintf("Shutdown requested. Exiting.\n");
         return false;
-    }
-    if (fLoaded) {
-        LogPrintf(" block index %15dms\n", GetTimeMillis() - nStart);
     }
 
     fs::path est_path = GetDataDir() / FEE_ESTIMATES_FILENAME;
@@ -1651,13 +1644,13 @@ bool AppInitMain()
     // Either install a handler to notify us when genesis activates, or set fHaveGenesis directly.
     // No locking, as this happens before any background thread is started.
     if (chainActive.Tip() == nullptr) {
-        uiInterface.NotifyBlockTip.connect(BlockNotifyGenesisWait);
+        uiInterface.NotifyBlockTip_connect(BlockNotifyGenesisWait);
     } else {
         fHaveGenesis = true;
     }
 
     if (gArgs.IsArgSet("-blocknotify"))
-        uiInterface.NotifyBlockTip.connect(BlockNotifyCallback);
+        uiInterface.NotifyBlockTip_connect(BlockNotifyCallback);
 
     std::vector<fs::path> vImportFiles;
     for (const std::string& strFile : gArgs.GetArgs("-loadblock")) {
@@ -1675,7 +1668,7 @@ bool AppInitMain()
         while (!fHaveGenesis && !ShutdownRequested()) {
             condvar_GenesisWait.wait_for(lock, std::chrono::milliseconds(500));
         }
-        uiInterface.NotifyBlockTip.disconnect(BlockNotifyGenesisWait);
+        uiInterface.NotifyBlockTip_disconnect(BlockNotifyGenesisWait);
     }
 
     if (ShutdownRequested()) {

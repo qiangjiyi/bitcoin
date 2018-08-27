@@ -1,5 +1,5 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2017 The Bitcoin Core developers
+// Copyright (c) 2009-2018 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -12,6 +12,7 @@
 #include <httpserver.h>
 #include <net.h>
 #include <netbase.h>
+#include <outputtype.h>
 #include <rpc/blockchain.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
@@ -91,9 +92,9 @@ class CWallet;
 
 static UniValue createmultisig(const JSONRPCRequest& request)
 {
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
     {
-        std::string msg = "createmultisig nrequired [\"key\",...]\n"
+        std::string msg = "createmultisig nrequired [\"key\",...] ( \"address_type\" )\n"
             "\nCreates a multi-signature address with n signature of m keys required.\n"
             "It returns a json object with the address and redeemScript.\n"
             "\nArguments:\n"
@@ -103,6 +104,7 @@ static UniValue createmultisig(const JSONRPCRequest& request)
             "       \"key\"                    (string) The hex-encoded public key\n"
             "       ,...\n"
             "     ]\n"
+            "3. \"address_type\"               (string, optional) The address type to use. Options are \"legacy\", \"p2sh-segwit\", and \"bech32\". Default is legacy.\n"
 
             "\nResult:\n"
             "{\n"
@@ -133,12 +135,21 @@ static UniValue createmultisig(const JSONRPCRequest& request)
         }
     }
 
+    // Get the output type
+    OutputType output_type = OutputType::LEGACY;
+    if (!request.params[2].isNull()) {
+        if (!ParseOutputType(request.params[2].get_str(), output_type)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown address type '%s'", request.params[2].get_str()));
+        }
+    }
+
     // Construct using pay-to-script-hash:
-    CScript inner = CreateMultisigRedeemscript(required, pubkeys);
-    CScriptID innerID(inner);
+    const CScript inner = CreateMultisigRedeemscript(required, pubkeys);
+    CBasicKeyStore keystore;
+    const CTxDestination dest = AddAndGetDestinationForScript(keystore, inner, output_type);
 
     UniValue result(UniValue::VOBJ);
-    result.pushKV("address", EncodeDestination(innerID));
+    result.pushKV("address", EncodeDestination(dest));
     result.pushKV("redeemScript", HexStr(inner.begin(), inner.end()));
 
     return result;
@@ -445,18 +456,6 @@ static UniValue echo(const JSONRPCRequest& request)
     return request.params;
 }
 
-static UniValue getinfo_deprecated(const JSONRPCRequest& request)
-{
-    throw JSONRPCError(RPC_METHOD_NOT_FOUND,
-        "getinfo\n"
-        "\nThis call was removed in version 0.16.0. Use the appropriate fields from:\n"
-        "- getblockchaininfo: blocks, difficulty, chain\n"
-        "- getnetworkinfo: version, protocolversion, timeoffset, connections, proxy, relayfee, warnings\n"
-        "- getwalletinfo: balance, keypoololdest, keypoolsize, paytxfee, unlocked_until, walletversion\n"
-        "\nbitcoin-cli has the option -getinfo to collect and format these in the old format."
-    );
-}
-
 static const CRPCCommand commands[] =
 { //  category              name                      actor (function)         argNames
   //  --------------------- ------------------------  -----------------------  ----------
@@ -471,7 +470,6 @@ static const CRPCCommand commands[] =
     { "hidden",             "setmocktime",            &setmocktime,            {"timestamp"}},
     { "hidden",             "echo",                   &echo,                   {"arg0","arg1","arg2","arg3","arg4","arg5","arg6","arg7","arg8","arg9"}},
     { "hidden",             "echojson",               &echo,                   {"arg0","arg1","arg2","arg3","arg4","arg5","arg6","arg7","arg8","arg9"}},
-    { "hidden",             "getinfo",                &getinfo_deprecated,     {}},
 };
 
 void RegisterMiscRPCCommands(CRPCTable &t)

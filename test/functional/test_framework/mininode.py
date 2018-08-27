@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2010 ArtForz -- public domain half-a-node
 # Copyright (c) 2012 Jeff Garzik
-# Copyright (c) 2010-2017 The Bitcoin Core developers
+# Copyright (c) 2010-2018 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Bitcoin P2P network half-a-node.
@@ -21,7 +21,7 @@ import struct
 import sys
 import threading
 
-from test_framework.messages import *
+from test_framework.messages import CBlockHeader, MIN_VERSION_SUPPORTED, msg_addr, msg_block, MSG_BLOCK, msg_blocktxn, msg_cmpctblock, msg_feefilter, msg_getaddr, msg_getblocks, msg_getblocktxn, msg_getdata, msg_getheaders, msg_headers, msg_inv, msg_mempool, msg_ping, msg_pong, msg_reject, msg_sendcmpct, msg_sendheaders, msg_tx, MSG_TX, MSG_TYPE_MASK, msg_verack, msg_version, NODE_NETWORK, NODE_WITNESS, sha256
 from test_framework.util import wait_until
 
 logger = logging.getLogger("TestFramework.mininode")
@@ -179,7 +179,17 @@ class P2PConnection(asyncio.Protocol):
             raise IOError('Not connected')
         self._log_message("send", message)
         tmsg = self._build_message(message)
-        NetworkThread.network_event_loop.call_soon_threadsafe(lambda: self._transport and self._transport.write(tmsg))
+
+        def maybe_write():
+            if not self._transport:
+                return
+            # Python <3.4.4 does not have is_closing, so we have to check for
+            # its existence explicitly as long as Bitcoin Core supports all
+            # Python 3.4 versions.
+            if hasattr(self._transport, 'is_closing') and self._transport.is_closing():
+                return
+            self._transport.write(tmsg)
+        NetworkThread.network_event_loop.call_soon_threadsafe(maybe_write)
 
     # Class utility methods
 
@@ -320,6 +330,15 @@ class P2PInterface(P2PConnection):
 
     def wait_for_block(self, blockhash, timeout=60):
         test_function = lambda: self.last_message.get("block") and self.last_message["block"].block.rehash() == blockhash
+        wait_until(test_function, timeout=timeout, lock=mininode_lock)
+
+    def wait_for_header(self, blockhash, timeout=60):
+        def test_function():
+            last_headers = self.last_message.get('headers')
+            if not last_headers:
+                return False
+            return last_headers.headers[0].rehash() == blockhash
+
         wait_until(test_function, timeout=timeout, lock=mininode_lock)
 
     def wait_for_getdata(self, timeout=60):

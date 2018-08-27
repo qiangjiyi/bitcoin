@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2017 The Bitcoin Core developers
+// Copyright (c) 2015-2018 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -86,7 +86,7 @@ static void JSONErrorReply(HTTPRequest* req, const UniValue& objError, const Uni
 //This function checks username and password against -rpcauth
 //entries from config file.
 static bool multiUserAuthorized(std::string strUserPass)
-{    
+{
     if (strUserPass.find(':') == std::string::npos) {
         return false;
     }
@@ -215,7 +215,7 @@ static bool InitRPCAuthentication()
 {
     if (gArgs.GetArg("-rpcpassword", "") == "")
     {
-        LogPrintf("No rpcpassword set - using random cookie authentication\n");
+        LogPrintf("No rpcpassword set - using random cookie authentication.\n");
         if (!GenerateAuthCookie(&strRPCUserColonPass)) {
             uiInterface.ThreadSafeMessageBox(
                 _("Error: A fatal internal error occurred, see debug.log for details"), // Same message as AbortNode
@@ -223,8 +223,12 @@ static bool InitRPCAuthentication()
             return false;
         }
     } else {
-        LogPrintf("Config options rpcuser and rpcpassword will soon be deprecated. Locally-run instances may remove rpcuser to use cookie-based auth, or may be replaced with rpcauth. Please see share/rpcuser for rpcauth auth generation.\n");
+        LogPrintf("Config options rpcuser and rpcpassword will soon be deprecated. Locally-run instances may remove rpcuser to use cookie-based auth, or may be replaced with rpcauth. Please see share/rpcauth for rpcauth auth generation.\n");
         strRPCUserColonPass = gArgs.GetArg("-rpcuser", "") + ":" + gArgs.GetArg("-rpcpassword", "");
+    }
+    if (gArgs.GetArg("-rpcauth","") != "")
+    {
+        LogPrintf("Using rpcauth authentication.\n");
     }
     return true;
 }
@@ -240,8 +244,9 @@ bool StartHTTPRPC()
     // ifdef can be removed once we switch to better endpoint support and API versioning
     RegisterHTTPHandler("/wallet/", false, HTTPReq_JSONRPC);
 #endif
-    assert(EventBase());
-    httpRPCTimerInterface = MakeUnique<HTTPRPCTimerInterface>(EventBase());
+    struct event_base* eventBase = EventBase();
+    assert(eventBase);
+    httpRPCTimerInterface = MakeUnique<HTTPRPCTimerInterface>(eventBase);
     RPCSetTimerInterface(httpRPCTimerInterface.get());
     return true;
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2017 The Bitcoin Core developers
+// Copyright (c) 2015-2018 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -252,7 +252,7 @@ public:
         resize(n);
     }
 
-    explicit prevector(size_type n, const T& val = T()) : _size(0) {
+    explicit prevector(size_type n, const T& val) : _size(0) {
         change_capacity(n);
         _size += n;
         fill(item_ptr(0), n, val);
